@@ -142,6 +142,34 @@ class TestSlackExecApproval:
         assert "..." in section_text
         assert len(section_text) < 5000
 
+    @pytest.mark.asyncio
+    async def test_long_approval_prompt_stays_within_slack_section_limit(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+
+        long_cmd = "x" * 5000
+        long_reason = "needs review " * 120
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command=long_cmd,
+            session_key="s",
+            description=long_reason,
+        )
+
+        kwargs = mock_client.chat_postMessage.call_args[1]
+        blocks = kwargs["blocks"]
+        section_text = blocks[0]["text"]["text"]
+        assert len(section_text) <= 3000
+        assert "..." in section_text
+        assert blocks[1]["type"] == "actions"
+        assert [element["action_id"] for element in blocks[1]["elements"]] == [
+            "hermes_approve_once",
+            "hermes_approve_session",
+            "hermes_approve_always",
+            "hermes_deny",
+        ]
+
 
 # ===========================================================================
 # _handle_approval_action — button click handler

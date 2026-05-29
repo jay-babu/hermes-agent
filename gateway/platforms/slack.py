@@ -52,6 +52,10 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+# Slack Block Kit section text fields must be fewer than 3001 chars.
+_SLACK_SECTION_TEXT_LIMIT = 3000
+_SLACK_APPROVAL_MIN_COMMAND_PREVIEW = 512
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -2237,6 +2241,52 @@ class SlackAdapter(BasePlatformAdapter):
 
         await self.handle_message(msg_event)
 
+    @staticmethod
+    def _truncate_for_slack(text: str, max_chars: int) -> str:
+        """Truncate text to a Slack field budget, keeping ellipsis inside it."""
+        if max_chars <= 0:
+            return ""
+        text = text or ""
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 3:
+            return "." * max_chars
+        return text[: max_chars - 3].rstrip() + "..."
+
+    def _format_exec_approval_text(
+        self,
+        command: str,
+        description: str,
+    ) -> str:
+        """Build Slack approval section text within Block Kit's 3000-char cap."""
+        header = ":warning: *Command Approval Required*\n"
+        code_prefix = "```"
+        code_suffix = "```\n"
+        reason_prefix = "Reason: "
+        static_len = len(header) + len(code_prefix) + len(code_suffix) + len(reason_prefix)
+        reason = description or "dangerous command"
+        command = command or ""
+
+        # Prefer showing at least a useful command preview. If the reason is
+        # long, trim it first; otherwise use the remaining budget for command.
+        reserved_command_budget = min(len(command), _SLACK_APPROVAL_MIN_COMMAND_PREVIEW)
+        reason_budget = max(
+            0,
+            _SLACK_SECTION_TEXT_LIMIT - static_len - reserved_command_budget,
+        )
+        reason_preview = self._truncate_for_slack(reason, reason_budget)
+        command_budget = max(
+            0,
+            _SLACK_SECTION_TEXT_LIMIT - static_len - len(reason_preview),
+        )
+        command_preview = self._truncate_for_slack(command, command_budget)
+
+        return (
+            f"{header}"
+            f"{code_prefix}{command_preview}{code_suffix}"
+            f"{reason_prefix}{reason_preview}"
+        )
+
     # ----- Approval button support (Block Kit) -----
 
     async def send_exec_approval(
@@ -2253,7 +2303,8 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
+            section_text = self._format_exec_approval_text(command, description)
+            text_preview = self._truncate_for_slack(command or "", 100)
             thread_ts = self._resolve_thread_ts(None, metadata)
 
             blocks = [
@@ -2261,11 +2312,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": (
-                            f":warning: *Command Approval Required*\n"
-                            f"```{cmd_preview}```\n"
-                            f"Reason: {description}"
-                        ),
+                        "text": section_text,
                     },
                 },
                 {
@@ -2303,7 +2350,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": f"⚠️ Command approval required: {cmd_preview[:100]}",
+                "text": f"⚠️ Command approval required: {text_preview}",
                 "blocks": blocks,
             }
             if thread_ts:
