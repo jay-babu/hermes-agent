@@ -1039,6 +1039,142 @@ class TestDeliverCrossPlatformThreadId:
         )
 
 
+class TestPagerDutySlackThreadMapping:
+    """PagerDuty webhook deliveries should stay in one Slack thread per incident."""
+
+    def _setup_adapter_with_mock_slack(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        mock_slack = AsyncMock()
+        mock_slack.send = AsyncMock(return_value=SendResult(success=True, message_id="1780000000.000200"))
+
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform("slack"): mock_slack}
+        mock_runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = mock_runner
+        return adapter, mock_slack
+
+    def _pagerduty_incident_payload(self, incident_id="PABC123", url=None):
+        if url is None:
+            url = f"https://transformity.pagerduty.com/incidents/{incident_id}"
+        return {
+            "event": {
+                "event_type": "incident.triggered",
+                "data": {
+                    "id": incident_id,
+                    "type": "incident",
+                    "summary": "High latency",
+                    "html_url": url,
+                },
+            }
+        }
+
+    def _pagerduty_note_payload(self, note_id="PNOTE1", incident_id="PABC123", url="https://transformity.pagerduty.com/incidents/PABC123"):
+        return {
+            "event": {
+                "event_type": "incident.annotated",
+                "data": {
+                    "id": note_id,
+                    "type": "incident_note",
+                    "summary": "note added",
+                    "incident": {
+                        "id": incident_id,
+                        "type": "incident",
+                        "summary": "High latency",
+                        "html_url": url,
+                    },
+                },
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_existing_pagerduty_incident_mapping_threads_followup_event(self, tmp_path, monkeypatch):
+        adapter, mock_slack = self._setup_adapter_with_mock_slack(tmp_path, monkeypatch)
+        (tmp_path / "webhook_threads.jsonl").write_text(
+            json.dumps({
+                "route": "pagerduty-incidents",
+                "key": "pagerduty_incident:PABC123",
+                "platform": "slack",
+                "chat_id": "C123",
+                "thread_ts": "1780000000.000100",
+                "incident_url": "https://transformity.pagerduty.com/incidents/PABC123",
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        delivery = {
+            "route": "pagerduty-incidents",
+            "deliver_extra": {"chat_id": "C123"},
+            "payload": self._pagerduty_note_payload(note_id="PNOTE1", incident_id="PABC123"),
+        }
+
+        await adapter._deliver_cross_platform("slack", "hello", delivery)
+
+        mock_slack.send.assert_awaited_once_with(
+            "C123", "hello", metadata={"thread_id": "1780000000.000100"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_pagerduty_incident_send_records_slack_thread_for_later_sends(self, tmp_path, monkeypatch):
+        adapter, mock_slack = self._setup_adapter_with_mock_slack(tmp_path, monkeypatch)
+        delivery = {
+            "route": "pagerduty-incidents",
+            "deliver_extra": {"chat_id": "C123"},
+            "payload": self._pagerduty_incident_payload(incident_id="PNEW123"),
+        }
+
+        await adapter._deliver_cross_platform("slack", "first message", delivery)
+        mock_slack.send.assert_awaited_once_with("C123", "first message", metadata=None)
+
+        thread_lines = (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(thread_lines) == 1
+        assert json.loads(thread_lines[0]) == {
+            "route": "pagerduty-incidents",
+            "key": "pagerduty_incident:PNEW123",
+            "platform": "slack",
+            "chat_id": "C123",
+            "thread_ts": "1780000000.000200",
+            "incident_url": "https://transformity.pagerduty.com/incidents/PNEW123",
+            "title": "High latency",
+        }
+
+        mock_slack.send.reset_mock()
+        await adapter._deliver_cross_platform("slack", "followup", delivery)
+        mock_slack.send.assert_awaited_once_with(
+            "C123", "followup", metadata={"thread_id": "1780000000.000200"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_note_key_mapping_is_reused_and_canonicalized_by_incident_url(self, tmp_path, monkeypatch):
+        adapter, mock_slack = self._setup_adapter_with_mock_slack(tmp_path, monkeypatch)
+        thread_file = tmp_path / "webhook_threads.jsonl"
+        thread_file.write_text(
+            json.dumps({
+                "route": "pagerduty-incidents",
+                "key": "pagerduty_incident:PNOTE1",
+                "platform": "slack",
+                "chat_id": "C123",
+                "thread_ts": "1780000000.000300",
+                "incident_url": "https://transformity.pagerduty.com/incidents/PABC123",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        delivery = {
+            "route": "pagerduty-incidents",
+            "deliver_extra": {"chat_id": "C123"},
+            "payload": self._pagerduty_note_payload(note_id="PNOTE2", incident_id="PABC123"),
+        }
+
+        await adapter._deliver_cross_platform("slack", "hello", delivery)
+
+        mock_slack.send.assert_awaited_once_with(
+            "C123", "hello", metadata={"thread_id": "1780000000.000300"}
+        )
+        records = [json.loads(line) for line in thread_file.read_text(encoding="utf-8").splitlines()]
+        assert records[-1]["key"] == "pagerduty_incident:PABC123"
+        assert records[-1]["thread_ts"] == "1780000000.000300"
+
+
 class TestWebhookApprovalCrossDelivery:
     """Webhook approval prompts should use the configured delivery adapter."""
 
