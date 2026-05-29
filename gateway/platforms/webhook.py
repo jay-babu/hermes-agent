@@ -36,7 +36,7 @@ import logging
 import re
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 
 try:
     from aiohttp import web
@@ -673,6 +673,14 @@ class WebhookAdapter(BasePlatformAdapter):
         if gl_token:
             return hmac.compare_digest(gl_token, secret)
 
+        # PagerDuty Webhooks V3: X-PagerDuty-Signature = v1=<hex HMAC-SHA256(raw body)>
+        # PagerDuty signs the exact raw request body with the route's webhook
+        # signing secret.  Treat malformed PagerDuty headers as hard failures
+        # instead of falling through to the generic HMAC scheme.
+        pd_sig = _header("X-PagerDuty-Signature")
+        if pd_sig:
+            return self._validate_pagerduty_signature(body, secret, pd_sig)
+
         # Generic: X-Webhook-Signature = <hex HMAC-SHA256>
         generic_sig = request.headers.get("X-Webhook-Signature", "")
         if generic_sig:
@@ -686,6 +694,26 @@ class WebhookAdapter(BasePlatformAdapter):
             "[webhook] Secret configured but no signature header found"
         )
         return False
+
+    def _validate_pagerduty_signature(
+        self,
+        body: bytes,
+        secret: str,
+        signature_header: str,
+    ) -> bool:
+        """Validate PagerDuty Webhooks V3 HMAC-SHA256 signatures."""
+        if not (body is not None and secret and signature_header):
+            return False
+
+        try:
+            version, signature = signature_header.strip().split("=", 1)
+        except ValueError:
+            return False
+        if version != "v1" or not signature:
+            return False
+
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected)
 
     def _validate_svix_signature(
         self,
@@ -879,29 +907,25 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
 
-    async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
-    ) -> SendResult:
-        """Route response to another platform (telegram, discord, etc.)."""
+    def _resolve_cross_platform_delivery(
+        self, platform_name: str, delivery: dict
+    ) -> tuple[Optional[BasePlatformAdapter], str, Optional[Dict[str, Any]], Optional[str]]:
+        """Resolve a cross-platform delivery target.
+
+        Returns ``(adapter, chat_id, metadata, error)`` so normal sends and
+        approval-button sends share the same chat/thread resolution rules.
+        """
         if not self.gateway_runner:
-            return SendResult(
-                success=False,
-                error="No gateway runner for cross-platform delivery",
-            )
+            return None, "", None, "No gateway runner for cross-platform delivery"
 
         try:
             target_platform = Platform(platform_name)
         except ValueError:
-            return SendResult(
-                success=False, error=f"Unknown platform: {platform_name}"
-            )
+            return None, "", None, f"Unknown platform: {platform_name}"
 
         adapter = self.gateway_runner.adapters.get(target_platform)
         if not adapter:
-            return SendResult(
-                success=False,
-                error=f"Platform {platform_name} not connected",
-            )
+            return None, "", None, f"Platform {platform_name} not connected"
 
         # Use home channel if no specific chat_id in deliver_extra
         extra = delivery.get("deliver_extra", {})
@@ -911,15 +935,75 @@ class WebhookAdapter(BasePlatformAdapter):
             if home:
                 chat_id = home.chat_id
             else:
-                return SendResult(
-                    success=False,
-                    error=f"No chat_id or home channel for {platform_name}",
-                )
+                return None, "", None, f"No chat_id or home channel for {platform_name}"
 
-        # Pass thread_id from deliver_extra so Telegram forum topics work
+        # Pass thread_id from deliver_extra so Telegram forum topics and Slack
+        # threads work for every webhook-originated send, including approval
+        # prompts emitted while the agent is blocked on a dangerous command.
         metadata = None
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
+
+        return adapter, chat_id, metadata, None
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Forward webhook-originated approval prompts to the delivery target.
+
+        Webhook events usually cross-deliver responses to Slack/Telegram/etc.
+        via ``deliver``.  Without this method, gateway/run.py falls back to the
+        webhook adapter's plain-text ``send()``, so Slack never gets its Block
+        Kit approval buttons and cannot unblock the webhook run with the right
+        session key.  Delegate to the configured target adapter's
+        ``send_exec_approval`` when it supports that richer contract.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type == "log":
+            return SendResult(success=False, error="Webhook route has no delivery target")
+
+        adapter, target_chat_id, target_metadata, error = self._resolve_cross_platform_delivery(
+            deliver_type, delivery
+        )
+        if error:
+            return SendResult(success=False, error=error)
+        assert adapter is not None
+
+        send_exec_approval = getattr(adapter, "send_exec_approval", None)
+        if not callable(send_exec_approval):
+            return SendResult(
+                success=False,
+                error=f"Platform {deliver_type} does not support approval buttons",
+            )
+        approval_sender = cast(
+            Callable[..., Awaitable[SendResult]],
+            send_exec_approval,
+        )
+
+        return await approval_sender(
+            chat_id=target_chat_id,
+            command=command,
+            session_key=session_key,
+            description=description,
+            metadata=target_metadata,
+        )
+
+    async def _deliver_cross_platform(
+        self, platform_name: str, content: str, delivery: dict
+    ) -> SendResult:
+        """Route response to another platform (telegram, discord, etc.)."""
+        adapter, chat_id, metadata, error = self._resolve_cross_platform_delivery(
+            platform_name, delivery
+        )
+        if error:
+            return SendResult(success=False, error=error)
+        assert adapter is not None
 
         return await adapter.send(chat_id, content, metadata=metadata)
