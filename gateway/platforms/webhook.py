@@ -67,6 +67,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_WEBHOOK_THREADS_FILENAME = "webhook_threads.jsonl"
 
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
@@ -519,6 +520,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # rate limiting, idempotency, and template rendering as agent mode.
         if route_config.get("deliver_only"):
             delivery = {
+                "route": route_name,
                 "deliver": route_config.get("deliver", "log"),
                 "deliver_extra": self._render_delivery_extra(
                     route_config.get("deliver_extra", {}), payload
@@ -577,6 +579,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
         deliver_config = {
+            "route": route_name,
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
@@ -907,6 +910,204 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
 
+    def _build_pagerduty_thread_binding(
+        self, platform_name: str, delivery: dict, chat_id: str
+    ) -> Optional[Dict[str, str]]:
+        """Return durable Slack-thread binding info for PagerDuty incidents.
+
+        PagerDuty follow-up events (notes, acknowledgements, status changes)
+        often carry their own event/note IDs in ``event.data.id``.  Those are
+        not stable incident identifiers, so prefer ``event.data.incident.id``
+        when present and only use ``event.data.id`` when the data object is the
+        incident itself.
+        """
+        if platform_name != "slack":
+            return None
+
+        route = str(delivery.get("route") or "")
+        payload = delivery.get("payload")
+        if not isinstance(payload, dict):
+            return None
+
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            event = payload
+
+        event_type = str(event.get("event_type") or event.get("type") or "")
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+
+        incident = data.get("incident")
+        incident_obj = incident if isinstance(incident, dict) else None
+        data_type = str(data.get("type") or data.get("resource_type") or "")
+        resource_type = str(event.get("resource_type") or "")
+
+        is_pagerduty_route = "pagerduty" in route.lower()
+        is_pagerduty_event = event_type.startswith("incident.") or resource_type == "incident"
+        if not is_pagerduty_route and not is_pagerduty_event:
+            return None
+
+        incident_id = ""
+        if incident_obj:
+            incident_id = str(incident_obj.get("id") or "")
+        if not incident_id and (data_type == "incident" or resource_type == "incident"):
+            incident_id = str(data.get("id") or "")
+        if not incident_id:
+            incident_id = str(data.get("incident_id") or event.get("incident_id") or "")
+
+        def _first_str(*values: Any) -> str:
+            for value in values:
+                if isinstance(value, str) and value:
+                    return value
+            return ""
+
+        incident_url = _first_str(
+            incident_obj.get("html_url") if incident_obj else None,
+            incident_obj.get("self") if incident_obj else None,
+            incident_obj.get("url") if incident_obj else None,
+            data.get("html_url"),
+            data.get("self"),
+            data.get("url"),
+        )
+        if not incident_id and incident_url:
+            match = re.search(r"/incidents/([A-Za-z0-9_-]+)", incident_url)
+            if match:
+                incident_id = match.group(1)
+
+        if not incident_id and not incident_url:
+            return None
+
+        title = _first_str(
+            incident_obj.get("summary") if incident_obj else None,
+            incident_obj.get("title") if incident_obj else None,
+            data.get("summary"),
+            data.get("title"),
+            event_type,
+        )
+        key = f"pagerduty_incident:{incident_id}" if incident_id else f"pagerduty_incident_url:{incident_url}"
+        return {
+            "route": route,
+            "key": key,
+            "platform": platform_name,
+            "chat_id": chat_id,
+            "incident_url": incident_url,
+            "title": title,
+        }
+
+    def _webhook_threads_path(self):
+        """Return the profile-aware durable webhook thread mapping path."""
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / _WEBHOOK_THREADS_FILENAME
+
+    def _read_webhook_thread_records(self) -> List[Dict[str, Any]]:
+        path = self._webhook_threads_path()
+        if not path.exists():
+            return []
+        records: List[Dict[str, Any]] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    records.append(record)
+        except Exception as exc:
+            logger.warning("[webhook] Failed to read webhook thread mappings: %s", exc)
+        return records
+
+    def _append_webhook_thread_mapping(self, binding: Dict[str, str], thread_ts: str) -> None:
+        if not thread_ts:
+            return
+        path = self._webhook_threads_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record: Dict[str, Any] = {
+                "route": binding.get("route", ""),
+                "key": binding.get("key", ""),
+                "platform": binding.get("platform", ""),
+                "chat_id": binding.get("chat_id", ""),
+                "thread_ts": thread_ts,
+            }
+            if binding.get("incident_url"):
+                record["incident_url"] = binding["incident_url"]
+            if binding.get("title"):
+                record["title"] = binding["title"]
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            logger.warning("[webhook] Failed to record webhook thread mapping: %s", exc)
+
+    def _lookup_webhook_thread_mapping(self, binding: Dict[str, str]) -> tuple[Optional[str], bool]:
+        """Return ``(thread_ts, exact_key_match)`` for a dynamic thread binding."""
+        exact_thread: Optional[str] = None
+        url_thread: Optional[str] = None
+        incident_url = binding.get("incident_url", "")
+        for record in self._read_webhook_thread_records():
+            if str(record.get("route") or "") != binding.get("route", ""):
+                continue
+            if str(record.get("platform") or "") != binding.get("platform", ""):
+                continue
+            if str(record.get("chat_id") or "") != binding.get("chat_id", ""):
+                continue
+            thread_ts = str(record.get("thread_ts") or "")
+            if not thread_ts:
+                continue
+            if str(record.get("key") or "") == binding.get("key", ""):
+                exact_thread = thread_ts
+            elif incident_url and str(record.get("incident_url") or "") == incident_url:
+                url_thread = thread_ts
+        if exact_thread:
+            return exact_thread, True
+        if url_thread:
+            return url_thread, False
+        return None, False
+
+    def _dynamic_thread_metadata(
+        self,
+        platform_name: str,
+        delivery: dict,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Add PagerDuty incident Slack thread metadata when a mapping exists."""
+        if metadata and metadata.get("thread_id"):
+            return metadata
+        binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
+        if not binding:
+            return metadata
+        thread_ts, exact = self._lookup_webhook_thread_mapping(binding)
+        if not thread_ts:
+            return metadata
+        if not exact:
+            self._append_webhook_thread_mapping(binding, thread_ts)
+        merged = dict(metadata or {})
+        merged["thread_id"] = thread_ts
+        return merged
+
+    def _record_dynamic_thread_from_result(
+        self,
+        platform_name: str,
+        delivery: dict,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+        result: SendResult,
+    ) -> None:
+        """Persist the first Slack top-level message as the incident thread root."""
+        if metadata and metadata.get("thread_id"):
+            return
+        if not result.success or not result.message_id:
+            return
+        binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
+        if not binding:
+            return
+        existing_thread, _ = self._lookup_webhook_thread_mapping(binding)
+        if existing_thread:
+            return
+        self._append_webhook_thread_mapping(binding, str(result.message_id))
+
     def _resolve_cross_platform_delivery(
         self, platform_name: str, delivery: dict
     ) -> tuple[Optional[BasePlatformAdapter], str, Optional[Dict[str, Any]], Optional[str]]:
@@ -944,6 +1145,10 @@ class WebhookAdapter(BasePlatformAdapter):
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
+        else:
+            metadata = self._dynamic_thread_metadata(
+                platform_name, delivery, chat_id, metadata
+            )
 
         return adapter, chat_id, metadata, None
 
@@ -987,13 +1192,17 @@ class WebhookAdapter(BasePlatformAdapter):
             send_exec_approval,
         )
 
-        return await approval_sender(
+        result = await approval_sender(
             chat_id=target_chat_id,
             command=command,
             session_key=session_key,
             description=description,
             metadata=target_metadata,
         )
+        self._record_dynamic_thread_from_result(
+            deliver_type, delivery, target_chat_id, target_metadata, result
+        )
+        return result
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict
@@ -1006,4 +1215,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=error)
         assert adapter is not None
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        self._record_dynamic_thread_from_result(
+            platform_name, delivery, chat_id, metadata, result
+        )
+        return result
