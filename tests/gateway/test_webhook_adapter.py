@@ -102,6 +102,11 @@ def _generic_signature(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
+def _pagerduty_signature(body: bytes, secret: str) -> str:
+    """Compute PagerDuty Webhooks V3 X-PagerDuty-Signature for *body*."""
+    return "v1=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 def _svix_signature(body: bytes, secret: str, msg_id: str, timestamp: str) -> str:
     """Compute a Svix v1 signature header for *body* using *secret*."""
     key = (
@@ -183,6 +188,30 @@ class TestValidateSignature:
         sig = _generic_signature(body, secret)
         req = _mock_request(headers={"X-Webhook-Signature": sig})
         assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_pagerduty_signature_valid(self):
+        """Valid PagerDuty Webhooks V3 v1 HMAC signatures are accepted."""
+        adapter = _make_adapter()
+        body = b'{"event":{"event_type":"incident.triggered"}}'
+        secret = "pagerduty-route-secret"
+        sig = _pagerduty_signature(body, secret)
+        req = _mock_request(headers={"X-PagerDuty-Signature": sig})
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_pagerduty_signature_invalid(self):
+        """Wrong PagerDuty Webhooks V3 signatures are rejected."""
+        adapter = _make_adapter()
+        body = b'{"event":{"event_type":"incident.triggered"}}'
+        req = _mock_request(headers={"X-PagerDuty-Signature": "v1=deadbeef"})
+        assert adapter._validate_signature(req, body, "pagerduty-route-secret") is False
+
+    def test_validate_pagerduty_signature_malformed_rejects(self):
+        """Malformed PagerDuty signature headers do not fall through as generic HMAC."""
+        adapter = _make_adapter()
+        body = b'{"event":{"event_type":"incident.triggered"}}'
+        sig = _generic_signature(body, "pagerduty-route-secret")
+        req = _mock_request(headers={"X-PagerDuty-Signature": sig})
+        assert adapter._validate_signature(req, body, "pagerduty-route-secret") is False
 
     def test_validate_svix_signature_valid(self):
         """Valid Svix/AgentMail v1 signature headers are accepted."""
@@ -1007,6 +1036,44 @@ class TestDeliverCrossPlatformThreadId:
         await adapter._deliver_cross_platform("telegram", "hello", delivery)
         mock_target.send.assert_awaited_once_with(
             "12345", "hello", metadata=None
+        )
+
+
+class TestWebhookApprovalCrossDelivery:
+    """Webhook approval prompts should use the configured delivery adapter."""
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_delegates_to_deliver_target_with_webhook_session_key(self):
+        adapter = _make_adapter()
+        target = AsyncMock()
+        target.send_exec_approval = AsyncMock(return_value=SendResult(success=True))
+
+        runner = MagicMock()
+        runner.adapters = {Platform("slack"): target}
+        runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = runner
+
+        session_key = "webhook:pagerduty-incidents:pd-delivery-1"
+        adapter._delivery_info[session_key] = {
+            "deliver": "slack",
+            "deliver_extra": {"chat_id": "C123", "thread_id": "178000.000100"},
+            "payload": {"event": {"event_type": "incident.triggered"}},
+        }
+
+        result = await adapter.send_exec_approval(
+            chat_id=session_key,
+            command="git reset --hard origin/main",
+            session_key=session_key,
+            description="dangerous command",
+        )
+
+        assert result.success is True
+        target.send_exec_approval.assert_awaited_once_with(
+            chat_id="C123",
+            command="git reset --hard origin/main",
+            session_key=session_key,
+            description="dangerous command",
+            metadata={"thread_id": "178000.000100"},
         )
 
 
