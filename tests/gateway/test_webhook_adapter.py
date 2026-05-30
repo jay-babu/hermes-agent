@@ -1007,11 +1007,18 @@ class TestPagerDutySlackThreadMapping:
         return {
             "event": {
                 "event_type": "incident.triggered",
+                "occurred_at": "2026-05-30T19:00:00Z",
                 "data": {
                     "id": incident_id,
                     "type": "incident",
                     "summary": "High latency",
                     "html_url": url,
+                    "incident_number": 1234,
+                    "status": "triggered",
+                    "urgency": "high",
+                    "service": {"summary": "POS Backend"},
+                    "priority": {"summary": "P1"},
+                    "created_at": "2026-05-30T18:58:22Z",
                 },
             }
         }
@@ -1033,6 +1040,80 @@ class TestPagerDutySlackThreadMapping:
                 },
             }
         }
+
+    @pytest.mark.asyncio
+    async def test_new_pagerduty_incident_creates_formatted_slack_thread_parent(self, tmp_path, monkeypatch):
+        adapter, mock_slack = self._setup_adapter_with_mock_slack(tmp_path, monkeypatch)
+        delivery = {
+            "route": "pagerduty-incidents",
+            "deliver": "slack",
+            "deliver_extra": {"chat_id": "C123"},
+            "payload": self._pagerduty_incident_payload(incident_id="PNEW123"),
+        }
+
+        await adapter._ensure_pagerduty_slack_thread_parent(delivery)
+
+        mock_slack.send.assert_awaited_once()
+        chat_id, content = mock_slack.send.await_args.args[:2]
+        assert chat_id == "C123"
+        assert mock_slack.send.await_args.kwargs == {"metadata": None}
+        assert ":rotating_light: *PagerDuty incident:*" in content
+        assert "<https://transformity.pagerduty.com/incidents/PNEW123|#1234: High latency>" in content
+        assert "*Status:* `triggered`" in content
+        assert "*Urgency:* high" in content
+        assert "*Priority:* P1" in content
+        assert "*Service:* POS Backend" in content
+        assert "*Incident ID:* `PNEW123`" in content
+        assert "Hermes is investigating in this thread." in content
+
+        records = [json.loads(line) for line in (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert records == [
+            {
+                "route": "pagerduty-incidents",
+                "key": "pagerduty_incident:PNEW123",
+                "platform": "slack",
+                "chat_id": "C123",
+                "thread_ts": "1780000000.000200",
+                "incident_url": "https://transformity.pagerduty.com/incidents/PNEW123",
+                "title": "High latency",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_webhook_handler_creates_parent_before_agent_run_when_home_channel_is_used(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        routes = {
+            "pagerduty-incidents": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Incident: {event.data.summary}",
+                "deliver": "slack",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        mock_slack = AsyncMock()
+        mock_slack.send = AsyncMock(return_value=SendResult(success=True, message_id="1780000000.000400"))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform("slack"): mock_slack}
+        mock_runner.config.get_home_channel.return_value = MagicMock(chat_id="C_HOME")
+        adapter.gateway_runner = mock_runner
+        adapter.handle_message = AsyncMock()
+
+        body = json.dumps(self._pagerduty_incident_payload(incident_id="PHOME123")).encode()
+        request = _mock_request(
+            headers={"X-Request-ID": "pd-home-1"},
+            body=body,
+            match_info={"route_name": "pagerduty-incidents"},
+        )
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 202
+        mock_slack.send.assert_awaited_once()
+        assert adapter.handle_message.call_count == 1
+        records = [json.loads(line) for line in (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert records[0]["key"] == "pagerduty_incident:PHOME123"
+        assert records[0]["chat_id"] == "C_HOME"
+        assert records[0]["thread_ts"] == "1780000000.000400"
 
     @pytest.mark.asyncio
     async def test_existing_pagerduty_incident_mapping_threads_followup_event(self, tmp_path, monkeypatch):
