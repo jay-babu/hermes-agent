@@ -689,18 +689,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
 
-        # PagerDuty incident webhooks need a stable, human-readable Slack
-        # thread root before the agent starts. Otherwise the first outbound
-        # status/context-pressure message can become the top-level Slack
-        # message, producing an unreadable incident parent. Best-effort only:
-        # if Slack is temporarily unavailable, preserve the webhook run.
-        try:
-            await self._ensure_pagerduty_slack_thread_parent(deliver_config)
-        except Exception as exc:
-            logger.warning(
-                "[webhook] Failed to create PagerDuty Slack thread parent: %s",
-                exc,
-            )
+        # Do not create an eager synthetic Slack parent for PagerDuty incidents.
+        # The original/readable behaviour is that the agent's first delivered
+        # incident triage becomes the top-level Slack message; follow-up
+        # PagerDuty webhooks are then threaded to that message via
+        # _record_dynamic_thread_from_result().
 
         # Build source and event
         source = self.build_source(

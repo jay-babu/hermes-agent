@@ -1133,7 +1133,7 @@ class TestPagerDutySlackThreadMapping:
         ]
 
     @pytest.mark.asyncio
-    async def test_webhook_handler_creates_parent_before_agent_run_when_home_channel_is_used(self, tmp_path, monkeypatch):
+    async def test_webhook_handler_does_not_create_parent_before_agent_run_when_home_channel_is_used(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         routes = {
             "pagerduty-incidents": {
@@ -1161,12 +1161,9 @@ class TestPagerDutySlackThreadMapping:
         response = await adapter._handle_webhook(request)
 
         assert response.status == 202
-        mock_slack.send.assert_awaited_once()
+        mock_slack.send.assert_not_awaited()
         assert adapter.handle_message.call_count == 1
-        records = [json.loads(line) for line in (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()]
-        assert records[0]["key"] == "pagerduty_incident:PHOME123"
-        assert records[0]["chat_id"] == "C_HOME"
-        assert records[0]["thread_ts"] == "1780000000.000400"
+        assert not (tmp_path / "webhook_threads.jsonl").exists()
 
     @pytest.mark.asyncio
     async def test_existing_pagerduty_incident_mapping_threads_followup_event(self, tmp_path, monkeypatch):
