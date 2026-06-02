@@ -1042,7 +1042,7 @@ class TestPagerDutySlackThreadMapping:
         }
 
     @pytest.mark.asyncio
-    async def test_new_pagerduty_incident_creates_formatted_slack_thread_parent(self, tmp_path, monkeypatch):
+    async def test_new_pagerduty_incident_creates_simple_slack_thread_parent_before_child_message(self, tmp_path, monkeypatch):
         adapter, mock_slack = self._setup_adapter_with_mock_slack(tmp_path, monkeypatch)
         delivery = {
             "route": "pagerduty-incidents",
@@ -1051,20 +1051,18 @@ class TestPagerDutySlackThreadMapping:
             "payload": self._pagerduty_incident_payload(incident_id="PNEW123"),
         }
 
-        await adapter._ensure_pagerduty_slack_thread_parent(delivery)
+        result = await adapter._deliver_cross_platform("slack", "⏳ Still working...", delivery)
 
-        mock_slack.send.assert_awaited_once()
-        chat_id, content = mock_slack.send.await_args.args[:2]
-        assert chat_id == "C123"
-        assert mock_slack.send.await_args.kwargs == {"metadata": None}
-        assert ":rotating_light: *PagerDuty incident:*" in content
-        assert "<https://transformity.pagerduty.com/incidents/PNEW123|#1234: High latency>" in content
-        assert "*Status:* `triggered`" in content
-        assert "*Urgency:* high" in content
-        assert "*Priority:* P1" in content
-        assert "*Service:* POS Backend" in content
-        assert "*Incident ID:* `PNEW123`" in content
-        assert "Hermes is investigating in this thread." in content
+        assert result.success is True
+        assert mock_slack.send.await_count == 2
+        parent_call, child_call = mock_slack.send.await_args_list
+        assert parent_call.args == (
+            "C123",
+            "PagerDuty incident PNEW123: High latency\nhttps://transformity.pagerduty.com/incidents/PNEW123",
+        )
+        assert parent_call.kwargs == {"metadata": None}
+        assert child_call.args == ("C123", "⏳ Still working...")
+        assert child_call.kwargs == {"metadata": {"thread_id": "1780000000.000200"}}
 
         records = [json.loads(line) for line in (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()]
         assert records == [
@@ -1149,7 +1147,15 @@ class TestPagerDutySlackThreadMapping:
         }
 
         await adapter._deliver_cross_platform("slack", "first message", delivery)
-        mock_slack.send.assert_awaited_once_with("C123", "first message", metadata=None)
+        assert mock_slack.send.await_count == 2
+        parent_call, child_call = mock_slack.send.await_args_list
+        assert parent_call.args == (
+            "C123",
+            "PagerDuty incident PNEW123: High latency\nhttps://transformity.pagerduty.com/incidents/PNEW123",
+        )
+        assert parent_call.kwargs == {"metadata": None}
+        assert child_call.args == ("C123", "first message")
+        assert child_call.kwargs == {"metadata": {"thread_id": "1780000000.000200"}}
 
         thread_lines = (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()
         assert len(thread_lines) == 1
