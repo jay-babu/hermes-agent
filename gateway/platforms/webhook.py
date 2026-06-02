@@ -29,7 +29,6 @@ Security:
 import asyncio
 import base64
 import binascii
-import html
 import hashlib
 import hmac
 import json
@@ -132,6 +131,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
+        self._thread_store_lock = asyncio.Lock()
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -689,11 +689,9 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
 
-        # Do not create an eager synthetic Slack parent for PagerDuty incidents.
-        # The original/readable behaviour is that the agent's first delivered
-        # incident triage becomes the top-level Slack message; follow-up
-        # PagerDuty webhooks are then threaded to that message via
-        # _record_dynamic_thread_from_result().
+        # The May 19/original Slack behaviour creates a small incident parent
+        # ("PagerDuty incident <id>: <title>" plus the URL) and sends progress,
+        # approvals, and the final triage as replies in that thread.
 
         # Build source and event
         source = self.build_source(
@@ -1175,100 +1173,23 @@ class WebhookAdapter(BasePlatformAdapter):
         return None, False
 
     def _format_pagerduty_thread_parent(self, binding: Dict[str, str], delivery: dict) -> str:
-        """Build the top-level Slack message for a PagerDuty incident thread."""
-        payload = delivery.get("payload")
-        event = payload.get("event") if isinstance(payload, dict) else None
-        if not isinstance(event, dict):
-            event = payload if isinstance(payload, dict) else {}
-        data = event.get("data") if isinstance(event, dict) else None
-        if not isinstance(data, dict) and isinstance(payload, dict):
-            data = payload.get("data")
-        if not isinstance(data, dict):
-            data = {}
-        incident = data.get("incident")
-        incident_obj = incident if isinstance(incident, dict) else data
-
-        def _str(value: Any) -> str:
-            if value is None:
-                return ""
-            if isinstance(value, (int, float)):
-                return str(value)
-            return value if isinstance(value, str) else ""
-
-        def _summary(value: Any) -> str:
-            if isinstance(value, dict):
-                for key in ("summary", "name", "description", "id"):
-                    text = _str(value.get(key))
-                    if text:
-                        return text
-            return _str(value)
-
-        def _first(*values: Any) -> str:
-            for value in values:
-                text = _summary(value)
-                if text:
-                    return text
-            return ""
-
-        def _esc(value: str) -> str:
-            return html.escape(value, quote=False)
-
-        event_type = _first(event.get("event_type"), event.get("type"))
-        title = _first(
-            binding.get("title"),
-            incident_obj.get("summary"),
-            incident_obj.get("title"),
-            event_type,
-            "PagerDuty incident",
-        )
-        incident_url = _first(
-            binding.get("incident_url"),
-            incident_obj.get("html_url"),
-            incident_obj.get("self"),
-            incident_obj.get("url"),
-        )
-        incident_id = binding.get("key", "").removeprefix("pagerduty_incident:")
+        """Build the May 19-style top-level Slack parent for a PagerDuty thread."""
+        del delivery  # The parent intentionally uses only stable binding fields.
+        key = binding.get("key", "")
+        incident_id = key.removeprefix("pagerduty_incident:")
         if incident_id.startswith("pagerduty_incident_url:"):
             incident_id = ""
-        incident_number = _first(incident_obj.get("incident_number"), incident_obj.get("number"))
-        service = _first(incident_obj.get("service"), data.get("service"))
-        priority = _first(incident_obj.get("priority"), data.get("priority"))
-        urgency = _first(incident_obj.get("urgency"), data.get("urgency"))
-        status = _first(incident_obj.get("status"), data.get("status"), event_type)
-        created_at = _first(
-            incident_obj.get("created_at"),
-            data.get("created_at"),
-            event.get("occurred_at"),
-        )
-
-        label = f"#{incident_number}: {title}" if incident_number else title
-        if incident_url:
-            headline = f":rotating_light: *PagerDuty incident:* <{incident_url}|{_esc(label)}>"
-        else:
-            headline = f":rotating_light: *PagerDuty incident:* {_esc(label)}"
-
-        fields = []
-        if status:
-            fields.append(f"*Status:* `{_esc(status)}`")
-        if urgency:
-            fields.append(f"*Urgency:* {_esc(urgency)}")
-        if priority:
-            fields.append(f"*Priority:* {_esc(priority)}")
-        if service:
-            fields.append(f"*Service:* {_esc(service)}")
-        if created_at:
-            fields.append(f"*Created:* {_esc(created_at)}")
-        if incident_id:
-            fields.append(f"*Incident ID:* `{_esc(incident_id)}`")
-
-        lines = [headline]
-        if fields:
-            lines.append(" • ".join(fields))
-        lines.append("Hermes is investigating in this thread.")
+        label = f"PagerDuty incident {incident_id}" if incident_id else "PagerDuty incident"
+        title = binding.get("title", "")
+        url = binding.get("incident_url", "")
+        first_line = f"{label}: {title}" if title and title not in label else label
+        lines = [first_line]
+        if url:
+            lines.append(url)
         return "\n".join(lines)
 
     async def _ensure_pagerduty_slack_thread_parent(self, delivery: dict) -> None:
-        """Create and record a formatted Slack thread root for new PagerDuty incidents."""
+        """Create and record a simple May 19-style Slack thread root for new PagerDuty incidents."""
         if delivery.get("deliver") != "slack":
             return
         extra = delivery.get("deliver_extra") or {}
@@ -1303,6 +1224,63 @@ class WebhookAdapter(BasePlatformAdapter):
                 "[webhook] PagerDuty Slack thread parent send failed: %s",
                 result.error,
             )
+
+    @staticmethod
+    def _thread_ts_from_send_result(result: SendResult) -> str:
+        if result.message_id:
+            return str(result.message_id)
+        raw = result.raw_response
+        if isinstance(raw, dict):
+            ts = raw.get("ts") or raw.get("message_ts")
+            if ts:
+                return str(ts)
+        return ""
+
+    async def _ensure_dynamic_thread_parent_metadata(
+        self,
+        platform_name: str,
+        adapter: BasePlatformAdapter,
+        delivery: dict,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Create/reuse a May 19-style PagerDuty Slack parent and return child metadata."""
+        if metadata and metadata.get("thread_id"):
+            return metadata
+        binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
+        if not binding:
+            return metadata
+
+        async with self._thread_store_lock:
+            thread_ts, exact = self._lookup_webhook_thread_mapping(binding)
+            if thread_ts and not exact:
+                self._append_webhook_thread_mapping(binding, thread_ts)
+            if not thread_ts:
+                parent = self._format_pagerduty_thread_parent(binding, delivery)
+                parent_result = await adapter.send(chat_id, parent, metadata=None)
+                if not parent_result.success:
+                    logger.warning(
+                        "[webhook] PagerDuty Slack thread parent send failed: %s",
+                        parent_result.error,
+                    )
+                    return metadata
+                thread_ts = self._thread_ts_from_send_result(parent_result)
+                if not thread_ts:
+                    logger.warning(
+                        "[webhook] PagerDuty Slack thread parent returned no thread timestamp"
+                    )
+                    return metadata
+                self._append_webhook_thread_mapping(binding, thread_ts)
+                logger.info(
+                    "[webhook] Created PagerDuty Slack thread parent route=%s key=%s thread=%s",
+                    binding.get("route", ""),
+                    binding.get("key", ""),
+                    thread_ts,
+                )
+
+        merged = dict(metadata or {})
+        merged["thread_id"] = thread_ts
+        return merged
 
     def _dynamic_thread_metadata(
         self,
@@ -1419,6 +1397,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if error:
             return SendResult(success=False, error=error)
         assert adapter is not None
+        target_metadata = await self._ensure_dynamic_thread_parent_metadata(
+            deliver_type, adapter, delivery, target_chat_id, target_metadata
+        )
 
         send_exec_approval = getattr(adapter, "send_exec_approval", None)
         if not callable(send_exec_approval):
@@ -1453,6 +1434,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if error:
             return SendResult(success=False, error=error)
         assert adapter is not None
+        metadata = await self._ensure_dynamic_thread_parent_metadata(
+            platform_name, adapter, delivery, chat_id, metadata
+        )
 
         result = await adapter.send(chat_id, content, metadata=metadata)
         self._record_dynamic_thread_from_result(
