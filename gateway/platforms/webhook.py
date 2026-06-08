@@ -353,6 +353,25 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
 
+    @staticmethod
+    def _is_pagerduty_transport_test(route_name: str, event_type: str, payload: Any) -> bool:
+        """Return True for PagerDuty's Pagey transport test events.
+
+        PagerDuty sends ``pagey.ping`` from its webhook UI to verify delivery.
+        It is not an incident/page and has no incident ID, so posting an agent
+        response to Slack creates an unrelated top-level message. Real PagerDuty
+        incident events continue through the normal dynamic-thread path.
+        """
+        if "pagerduty" not in route_name.lower() and not event_type.startswith("pagey."):
+            return False
+        if event_type == "pagey.ping":
+            return True
+        event = payload.get("event") if isinstance(payload, dict) else None
+        if not isinstance(event, dict):
+            event = payload if isinstance(payload, dict) else {}
+        resource_type = str(event.get("resource_type") or payload.get("resource_type", "") if isinstance(payload, dict) else "")
+        return resource_type == "pagey"
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
@@ -451,6 +470,16 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return web.json_response(
                 {"status": "ignored", "event": event_type}
+            )
+
+        if self._is_pagerduty_transport_test(route_name, event_type, payload):
+            logger.info(
+                "[webhook] Ignoring PagerDuty transport test event=%s route=%s",
+                event_type,
+                route_name,
+            )
+            return web.json_response(
+                {"status": "ignored", "event": event_type, "reason": "pagerduty_transport_test"}
             )
 
         # Format prompt from template
@@ -1113,7 +1142,7 @@ class WebhookAdapter(BasePlatformAdapter):
         assert adapter is not None
 
         parent = self._format_pagerduty_thread_parent(binding, delivery)
-        result = await adapter.send(chat_id, parent, metadata=None)
+        result = await adapter.send(chat_id, parent, metadata={"suppress_unfurls": True})
         if result.success and result.message_id:
             self._append_webhook_thread_mapping(binding, str(result.message_id))
             logger.info(
@@ -1149,6 +1178,11 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> Optional[Dict[str, Any]]:
         """Create/reuse a May 19-style PagerDuty Slack parent and return child metadata."""
         if metadata and metadata.get("thread_id"):
+            binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
+            if binding:
+                merged = dict(metadata)
+                merged["suppress_unfurls"] = True
+                return merged
             return metadata
         binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
         if not binding:
@@ -1160,7 +1194,9 @@ class WebhookAdapter(BasePlatformAdapter):
                 self._append_webhook_thread_mapping(binding, thread_ts)
             if not thread_ts:
                 parent = self._format_pagerduty_thread_parent(binding, delivery)
-                parent_result = await adapter.send(chat_id, parent, metadata=None)
+                parent_result = await adapter.send(
+                    chat_id, parent, metadata={"suppress_unfurls": True}
+                )
                 if not parent_result.success:
                     logger.warning(
                         "[webhook] PagerDuty Slack thread parent send failed: %s",
@@ -1183,6 +1219,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         merged = dict(metadata or {})
         merged["thread_id"] = thread_ts
+        merged["suppress_unfurls"] = True
         return merged
 
     def _dynamic_thread_metadata(
@@ -1194,6 +1231,11 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> Optional[Dict[str, Any]]:
         """Add PagerDuty incident Slack thread metadata when a mapping exists."""
         if metadata and metadata.get("thread_id"):
+            binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
+            if binding:
+                merged = dict(metadata)
+                merged["suppress_unfurls"] = True
+                return merged
             return metadata
         binding = self._build_pagerduty_thread_binding(platform_name, delivery, chat_id)
         if not binding:
@@ -1205,6 +1247,7 @@ class WebhookAdapter(BasePlatformAdapter):
             self._append_webhook_thread_mapping(binding, thread_ts)
         merged = dict(metadata or {})
         merged["thread_id"] = thread_ts
+        merged["suppress_unfurls"] = True
         return merged
 
     def _record_dynamic_thread_from_result(
