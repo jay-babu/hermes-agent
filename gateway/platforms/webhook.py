@@ -354,6 +354,24 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
 
     @staticmethod
+    def _is_pagerduty_route_or_event(route_name: str, event_type: str) -> bool:
+        """Return True when a webhook looks like PagerDuty traffic."""
+        event_type = event_type.lower()
+        return (
+            "pagerduty" in route_name.lower()
+            or event_type.startswith("incident.")
+            or event_type.startswith("pagey.")
+        )
+
+    @staticmethod
+    def _pagerduty_event_payload(payload: Any) -> Dict[str, Any]:
+        """Normalize PagerDuty webhook payloads to their nested event dict."""
+        if not isinstance(payload, dict):
+            return {}
+        event = payload.get("event")
+        return event if isinstance(event, dict) else payload
+
+    @staticmethod
     def _is_pagerduty_transport_test(route_name: str, event_type: str, payload: Any) -> bool:
         """Return True for PagerDuty's Pagey transport test events.
 
@@ -362,15 +380,53 @@ class WebhookAdapter(BasePlatformAdapter):
         response to Slack creates an unrelated top-level message. Real PagerDuty
         incident events continue through the normal dynamic-thread path.
         """
-        if "pagerduty" not in route_name.lower() and not event_type.startswith("pagey."):
+        if not WebhookAdapter._is_pagerduty_route_or_event(route_name, event_type):
             return False
         if event_type == "pagey.ping":
             return True
-        event = payload.get("event") if isinstance(payload, dict) else None
-        if not isinstance(event, dict):
-            event = payload if isinstance(payload, dict) else {}
+        event = WebhookAdapter._pagerduty_event_payload(payload)
         resource_type = str(event.get("resource_type") or payload.get("resource_type", "") if isinstance(payload, dict) else "")
         return resource_type == "pagey"
+
+    @staticmethod
+    def _is_gamma_pagerduty_incident(route_name: str, event_type: str, payload: Any) -> bool:
+        """Return True for PagerDuty incidents whose human-facing name contains GAMMA.
+
+        Gamma PagerDuty incidents are intentionally not triaged or delivered to
+        Slack. PagerDuty event shapes vary by event type: incident objects may be
+        at ``event.data`` or ``event.data.incident`` and service names can be
+        nested below either object, so inspect the common title/name/summary
+        fields from both locations.
+        """
+        if not WebhookAdapter._is_pagerduty_route_or_event(route_name, event_type):
+            return False
+
+        event = WebhookAdapter._pagerduty_event_payload(payload)
+        data = event.get("data")
+        if not isinstance(data, dict) and isinstance(payload, dict):
+            data = payload.get("data")
+        if not isinstance(data, dict):
+            data = {}
+
+        incident = data.get("incident")
+        incident_obj = incident if isinstance(incident, dict) else data
+
+        candidates: List[str] = []
+        for obj in (incident_obj, data, event):
+            if not isinstance(obj, dict):
+                continue
+            for key in ("summary", "title", "name"):
+                value = obj.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+            service = obj.get("service")
+            if isinstance(service, dict):
+                for key in ("summary", "name"):
+                    value = service.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+
+        return any("gamma" in candidate.lower() for candidate in candidates)
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
@@ -480,6 +536,16 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return web.json_response(
                 {"status": "ignored", "event": event_type, "reason": "pagerduty_transport_test"}
+            )
+
+        if self._is_gamma_pagerduty_incident(route_name, event_type, payload):
+            logger.info(
+                "[webhook] Ignoring GAMMA PagerDuty incident event=%s route=%s",
+                event_type,
+                route_name,
+            )
+            return web.json_response(
+                {"status": "ignored", "event": event_type, "reason": "pagerduty_gamma_incident"}
             )
 
         # Format prompt from template

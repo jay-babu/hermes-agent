@@ -528,6 +528,84 @@ class TestHTTPHandling:
             assert data["route"] == "test"
 
     @pytest.mark.asyncio
+    async def test_gamma_pagerduty_incident_is_ignored_before_agent_or_slack(self):
+        """PagerDuty incidents with GAMMA in the incident name are suppressed."""
+        routes = {
+            "pagerduty-incidents": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "triage {event.data.incident.summary}",
+                "deliver": "slack",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "event": {
+                "event_type": "incident.triggered",
+                "data": {
+                    "incident": {
+                        "id": "P123",
+                        "summary": "GAMMA POS API high error rate",
+                        "html_url": "https://example.pagerduty.com/incidents/P123",
+                    }
+                },
+            }
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/pagerduty-incidents",
+                json=payload,
+                headers={"X-Request-ID": "gamma-incident-1"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "status": "ignored",
+                "event": "incident.triggered",
+                "reason": "pagerduty_gamma_incident",
+            }
+
+        adapter.handle_message.assert_not_called()
+        assert adapter._delivery_info == {}
+
+    @pytest.mark.asyncio
+    async def test_non_gamma_pagerduty_incident_is_accepted(self):
+        """Non-GAMMA PagerDuty incidents still enter normal triage."""
+        routes = {
+            "pagerduty-incidents": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "triage {event.data.incident.summary}",
+                "deliver": "slack",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "event": {
+                "event_type": "incident.triggered",
+                "data": {
+                    "incident": {
+                        "id": "P124",
+                        "summary": "Production POS API high error rate",
+                    }
+                },
+            }
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/pagerduty-incidents",
+                json=payload,
+                headers={"X-Request-ID": "prod-incident-1"},
+            )
+            assert resp.status == 202
+            data = await resp.json()
+            assert data["status"] == "accepted"
+
+    @pytest.mark.asyncio
     async def test_route_without_secret_rejects_unsigned_request(self):
         """Missing HMAC secret must fail closed even if connect() was bypassed."""
         routes = {"test": {"prompt": "hi"}}
