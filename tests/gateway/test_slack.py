@@ -3080,6 +3080,25 @@ class TestMessageSplitting:
         assert kwargs.get("mrkdwn") is True
 
     @pytest.mark.asyncio
+    async def test_send_suppresses_unfurls_when_metadata_requests_it(self, adapter):
+        """Webhook routes can suppress duplicate preview cards per message."""
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+        await adapter.send(
+            "C123",
+            "Incident: <https://transformity.pagerduty.com/incidents/PABC123>",
+            metadata={"suppress_unfurls": True},
+        )
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert kwargs.get("unfurl_links") is False
+        assert kwargs.get("unfurl_media") is False
+
+        adapter._app.client.chat_postMessage.reset_mock()
+        await adapter.send("C123", "Normal link: https://example.com/spec")
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert "unfurl_links" not in kwargs
+        assert "unfurl_media" not in kwargs
+
+    @pytest.mark.asyncio
     async def test_send_does_not_double_escape_entities(self, adapter):
         """Pre-escaped &amp; in sent messages must not become &amp;amp;."""
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})

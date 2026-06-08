@@ -1168,12 +1168,20 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
+            # Allow callers such as webhook routes to suppress Slack link
+            # previews for specific messages without changing the default
+            # unfurl behavior for ordinary Hermes Slack replies.
+            suppress_unfurls = bool(metadata and metadata.get("suppress_unfurls"))
+
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
                 }
+                if suppress_unfurls:
+                    kwargs["unfurl_links"] = False
+                    kwargs["unfurl_media"] = False
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                     # Only broadcast the first chunk of the first reply

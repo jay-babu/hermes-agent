@@ -1113,9 +1113,11 @@ class TestPagerDutySlackThreadMapping:
             "C123",
             "PagerDuty incident PNEW123: High latency\nhttps://transformity.pagerduty.com/incidents/PNEW123",
         )
-        assert parent_call.kwargs == {"metadata": None}
+        assert parent_call.kwargs == {"metadata": {"suppress_unfurls": True}}
         assert child_call.args == ("C123", "⏳ Still working...")
-        assert child_call.kwargs == {"metadata": {"thread_id": "1780000000.000200"}}
+        assert child_call.kwargs == {
+            "metadata": {"thread_id": "1780000000.000200", "suppress_unfurls": True}
+        }
 
         records = [json.loads(line) for line in (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()]
         assert records == [
@@ -1164,6 +1166,50 @@ class TestPagerDutySlackThreadMapping:
         assert not (tmp_path / "webhook_threads.jsonl").exists()
 
     @pytest.mark.asyncio
+    async def test_webhook_handler_ignores_pagerduty_pagey_ping_without_slack_post(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        routes = {
+            "pagerduty-incidents": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Incident: {event.data.summary}",
+                "deliver": "slack",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        mock_slack = AsyncMock()
+        mock_slack.send = AsyncMock(return_value=SendResult(success=True, message_id="1780000000.000500"))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform("slack"): mock_slack}
+        mock_runner.config.get_home_channel.return_value = MagicMock(chat_id="C_HOME")
+        adapter.gateway_runner = mock_runner
+        adapter.handle_message = AsyncMock()
+
+        body = json.dumps({
+            "event": {
+                "event_type": "pagey.ping",
+                "resource_type": "pagey",
+                "message": "Hello from your friend Pagey!",
+            }
+        }).encode()
+        request = _mock_request(
+            headers={"X-Request-ID": "pd-pagey-ping-1"},
+            body=body,
+            match_info={"route_name": "pagerduty-incidents"},
+        )
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 200
+        assert json.loads(response.text) == {
+            "status": "ignored",
+            "event": "pagey.ping",
+            "reason": "pagerduty_transport_test",
+        }
+        mock_slack.send.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+        assert not (tmp_path / "webhook_threads.jsonl").exists()
+
+    @pytest.mark.asyncio
     async def test_existing_pagerduty_incident_mapping_threads_followup_event(self, tmp_path, monkeypatch):
         adapter, mock_slack = self._setup_adapter_with_mock_slack(tmp_path, monkeypatch)
         (tmp_path / "webhook_threads.jsonl").write_text(
@@ -1187,7 +1233,9 @@ class TestPagerDutySlackThreadMapping:
         await adapter._deliver_cross_platform("slack", "hello", delivery)
 
         mock_slack.send.assert_awaited_once_with(
-            "C123", "hello", metadata={"thread_id": "1780000000.000100"}
+            "C123",
+            "hello",
+            metadata={"thread_id": "1780000000.000100", "suppress_unfurls": True},
         )
 
     @pytest.mark.asyncio
@@ -1206,9 +1254,11 @@ class TestPagerDutySlackThreadMapping:
             "C123",
             "PagerDuty incident PNEW123: High latency\nhttps://transformity.pagerduty.com/incidents/PNEW123",
         )
-        assert parent_call.kwargs == {"metadata": None}
+        assert parent_call.kwargs == {"metadata": {"suppress_unfurls": True}}
         assert child_call.args == ("C123", "first message")
-        assert child_call.kwargs == {"metadata": {"thread_id": "1780000000.000200"}}
+        assert child_call.kwargs == {
+            "metadata": {"thread_id": "1780000000.000200", "suppress_unfurls": True}
+        }
 
         thread_lines = (tmp_path / "webhook_threads.jsonl").read_text(encoding="utf-8").splitlines()
         assert len(thread_lines) == 1
@@ -1225,7 +1275,9 @@ class TestPagerDutySlackThreadMapping:
         mock_slack.send.reset_mock()
         await adapter._deliver_cross_platform("slack", "followup", delivery)
         mock_slack.send.assert_awaited_once_with(
-            "C123", "followup", metadata={"thread_id": "1780000000.000200"}
+            "C123",
+            "followup",
+            metadata={"thread_id": "1780000000.000200", "suppress_unfurls": True},
         )
 
     @pytest.mark.asyncio
@@ -1252,7 +1304,9 @@ class TestPagerDutySlackThreadMapping:
         await adapter._deliver_cross_platform("slack", "hello", delivery)
 
         mock_slack.send.assert_awaited_once_with(
-            "C123", "hello", metadata={"thread_id": "1780000000.000300"}
+            "C123",
+            "hello",
+            metadata={"thread_id": "1780000000.000300", "suppress_unfurls": True},
         )
         records = [json.loads(line) for line in thread_file.read_text(encoding="utf-8").splitlines()]
         assert records[-1]["key"] == "pagerduty_incident:PABC123"
