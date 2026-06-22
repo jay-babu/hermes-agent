@@ -477,18 +477,14 @@ class WebhookAdapter(BasePlatformAdapter):
         return resource_type == "pagey"
 
     @staticmethod
-    def _is_gamma_pagerduty_incident(route_name: str, event_type: str, payload: Any) -> bool:
-        """Return True for PagerDuty incidents whose human-facing name contains GAMMA.
+    def _pagerduty_incident_text_candidates(payload: Any) -> List[str]:
+        """Return common human-facing PagerDuty incident strings.
 
-        Gamma PagerDuty incidents are intentionally not triaged or delivered to
-        Slack. PagerDuty event shapes vary by event type: incident objects may be
-        at ``event.data`` or ``event.data.incident`` and service names can be
+        PagerDuty event shapes vary by event type: incident objects may be at
+        ``event.data`` or ``event.data.incident`` and service names can be
         nested below either object, so inspect the common title/name/summary
         fields from both locations.
         """
-        if not WebhookAdapter._is_pagerduty_route_or_event(route_name, event_type):
-            return False
-
         event = WebhookAdapter._pagerduty_event_payload(payload)
         data = event.get("data")
         if not isinstance(data, dict) and isinstance(payload, dict):
@@ -513,8 +509,32 @@ class WebhookAdapter(BasePlatformAdapter):
                     value = service.get(key)
                     if isinstance(value, str):
                         candidates.append(value)
+        return candidates
 
-        return any("gamma" in candidate.lower() for candidate in candidates)
+    @staticmethod
+    def _is_gamma_pagerduty_incident(route_name: str, event_type: str, payload: Any) -> bool:
+        """Return True for PagerDuty incidents whose human-facing name contains GAMMA."""
+        if not WebhookAdapter._is_pagerduty_route_or_event(route_name, event_type):
+            return False
+
+        return any(
+            "gamma" in candidate.lower()
+            for candidate in WebhookAdapter._pagerduty_incident_text_candidates(payload)
+        )
+
+    @staticmethod
+    def _is_stripe_account_requirement_pagerduty_incident(
+        route_name: str, event_type: str, payload: Any
+    ) -> bool:
+        """Return True for noisy Stripe account requirement PagerDuty alerts."""
+        if not WebhookAdapter._is_pagerduty_route_or_event(route_name, event_type):
+            return False
+
+        for candidate in WebhookAdapter._pagerduty_incident_text_candidates(payload):
+            normalized = candidate.lower()
+            if "stripe account" in normalized and "requirement issues" in normalized:
+                return True
+        return False
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
@@ -647,6 +667,20 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return web.json_response(
                 {"status": "ignored", "event": event_type, "reason": "pagerduty_gamma_incident"}
+            )
+
+        if self._is_stripe_account_requirement_pagerduty_incident(route_name, event_type, payload):
+            logger.info(
+                "[webhook] Ignoring Stripe account requirement PagerDuty incident event=%s route=%s",
+                event_type,
+                route_name,
+            )
+            return web.json_response(
+                {
+                    "status": "ignored",
+                    "event": event_type,
+                    "reason": "pagerduty_stripe_account_requirement_incident",
+                }
             )
 
         # Format prompt from template

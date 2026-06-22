@@ -572,6 +572,49 @@ class TestHTTPHandling:
         assert adapter._delivery_info == {}
 
     @pytest.mark.asyncio
+    async def test_stripe_account_requirement_pagerduty_incident_is_ignored_before_agent_or_slack(self):
+        """Noisy Stripe account requirement PagerDuty incidents are suppressed."""
+        routes = {
+            "pagerduty-incidents": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "triage {event.data.incident.summary}",
+                "deliver": "slack",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "event": {
+                "event_type": "incident.triggered",
+                "data": {
+                    "incident": {
+                        "id": "Q2ICVSKOFSV01Z",
+                        "summary": "[PROD] Stripe account has requirement issues: Lord Shree Sai LLC acct_1Tg91eDl0veenDVj",
+                        "html_url": "https://transformity.pagerduty.com/incidents/Q2ICVSKOFSV01Z",
+                    }
+                },
+            }
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/pagerduty-incidents",
+                json=payload,
+                headers={"X-Request-ID": "stripe-requirement-incident-1"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "status": "ignored",
+                "event": "incident.triggered",
+                "reason": "pagerduty_stripe_account_requirement_incident",
+            }
+
+        adapter.handle_message.assert_not_called()
+        assert adapter._delivery_info == {}
+
+    @pytest.mark.asyncio
     async def test_non_gamma_pagerduty_incident_is_accepted(self):
         """Non-GAMMA PagerDuty incidents still enter normal triage."""
         routes = {
